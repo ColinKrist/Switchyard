@@ -23,11 +23,13 @@ pub mod metrics;
 mod observability;
 mod observation;
 pub mod raw;
+pub mod load_tracker;
 pub mod run;
 
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
+pub use load_tracker::ModelLoadTracker;
 pub use observation::{LlmCallObservation, RunObservation, RunObserver};
 pub use raw::RawResponse;
 pub use run::{ClientRouter, run};

@@ -156,6 +156,11 @@ impl Route {
     pub fn caller_auth(&self) -> Option<CallerAuthKind> {
         self.caller_auth
     }
+    /// The client router configured for this route.
+    pub fn clients(&self) -> &ClientRouter {
+        &self.clients
+    }
+
 
     /// Resolves a selected model to this route's non-secret target metadata.
     pub(crate) fn decision_target(&self, model: &ModelId) -> Option<DecisionTarget> {

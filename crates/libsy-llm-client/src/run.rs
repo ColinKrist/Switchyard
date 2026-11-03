@@ -25,7 +25,7 @@ use switchyard_protocol::{
 };
 
 use crate::observation::{LlmCallObservation, RunObservation, RunObserver};
-use crate::{metrics, observability};
+use crate::{metrics, observability, ModelLoadTracker};
 
 /// Run one request to completion, serving every offloaded model call with `client`.
 ///
@@ -85,6 +85,7 @@ pub async fn run(
             &outcome.request,
             &models,
             &observe,
+            clients.load_tracker(),
         )
         .await;
         let answer_duration = answer_started.elapsed();
@@ -145,38 +146,58 @@ async fn serve(
         &call.request,
         &call.models,
         &observe,
+        None,
     )
     .await;
     call.respond(result)
 }
 
 /// Try candidates in order until one succeeds or a failure stops fallback.
+///
+/// When `tracker` is present, candidates are ordered load-aware: the preferred
+/// target is preserved while under capacity; once at or above capacity, traffic
+/// is directed to the least-loaded candidate. If every candidate is at capacity,
+/// the least-loaded candidate is chosen.
 async fn call_first_available(
     clients: &ClientRouter,
     algorithm: &str,
     request: &Request,
     models: &[ModelId],
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
+    tracker: Option<&ModelLoadTracker>,
 ) -> Result<Response> {
-    for (index, target) in models.iter().enumerate() {
+    let ordered_models = match tracker {
+        Some(t) => t.order_and_acquire(models),
+        None => models.to_vec(),
+    };
+
+    for (index, target) in ordered_models.iter().enumerate() {
+        if index > 0 {
+            if let Some(t) = tracker {
+                t.acquire(target);
+            }
+        }
         let request = request_for(request, target);
-        match call_one(
+        let result = call_one(
             clients,
             target,
             request,
             algorithm,
             observe,
             index,
-            models.len(),
+            ordered_models.len(),
         )
-        .await
-        {
+        .await;
+        if let Some(t) = tracker {
+            t.release(target);
+        }
+        match result {
             Ok(response) => return Ok(response),
-            Err(error) if index + 1 == models.len() => return Err(error),
+            Err(error) if index + 1 == ordered_models.len() => return Err(error),
             Err(error) => match fallback_reason(&error) {
                 Some(reason) => tracing::info!(
                     from = %target,
-                    to = %models[index + 1],
+                    to = %ordered_models[index + 1],
                     reason = reason.as_str(),
                     "model call failed; trying next candidate"
                 ),
@@ -316,6 +337,7 @@ fn request_for(request: &Request, target: &ModelId) -> Request {
 #[derive(Clone)]
 pub struct ClientRouter {
     routing: Arc<Routing>,
+    load_tracker: Option<Arc<ModelLoadTracker>>,
 }
 
 enum Routing {
@@ -330,6 +352,7 @@ impl ClientRouter {
     pub fn new(by_model: HashMap<ModelId, Arc<dyn RoutedLlmClient>>) -> Self {
         Self {
             routing: Arc::new(Routing::ByModel(by_model)),
+            load_tracker: None,
         }
     }
 
@@ -341,7 +364,23 @@ impl ClientRouter {
     pub fn single(client: Arc<dyn RoutedLlmClient>) -> Self {
         Self {
             routing: Arc::new(Routing::Single(client)),
+            load_tracker: None,
         }
+    }
+
+    /// Attach a per-target in-flight load cap.
+    ///
+    /// When present, the answer-call path orders candidates load-aware:
+    /// preferred target is preserved while under capacity; once at or above
+    /// capacity, traffic is directed to the least-loaded candidate.
+    pub fn with_load_tracker(mut self, tracker: Arc<ModelLoadTracker>) -> Self {
+        self.load_tracker = Some(tracker);
+        self
+    }
+
+    /// The load tracker attached to this router, if any.
+    pub fn load_tracker(&self) -> Option<&ModelLoadTracker> {
+        self.load_tracker.as_deref()
     }
 
     /// The client that serves `model`.
@@ -387,7 +426,7 @@ mod tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
+    use crate::{Backend, HttpBackendConfig, ModelConfig, ModelLoadTracker, TranslatingLlmClient};
 
     struct CandidateAlgorithm {
         models: Vec<ModelId>,
@@ -727,6 +766,89 @@ mod tests {
             .expect_err("the stream should fail during aggregation");
         assert!(error.to_string().contains("stream failed"));
         assert_eq!(&*client.calls.lock(), &[ModelId::from("weak")]);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn answer_call_skips_targets_at_capacity() -> Result<()> {
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let tracker = ModelLoadTracker::new(vec![
+            (ModelId::from("weak"), 1),
+            (ModelId::from("strong"), 1),
+        ]);
+        // Fill "weak" to capacity so the answer call must fall through to "strong".
+        assert!(tracker.try_acquire(&ModelId::from("weak")));
+
+        let router = ClientRouter::single(client.clone()).with_load_tracker(Arc::new(tracker));
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["weak".into(), "strong".into()],
+        });
+        let result = run(algorithm, router, request(), None).await;
+
+        // The answer call skipped the saturated "weak" target and answered from "strong".
+        let (_, response) = result?;
+        assert_eq!(&*client.calls.lock(), &[ModelId::from("strong")]);
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("strong")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn answer_call_picks_least_loaded_when_all_at_capacity() -> Result<()> {
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let tracker = ModelLoadTracker::new(vec![
+            (ModelId::from("weak"), 1),
+            (ModelId::from("strong"), 1),
+        ]);
+        // "weak" has 2 in flight (cap 1), "strong" has 1 in flight (cap 1).
+        tracker.acquire(&ModelId::from("weak"));
+        tracker.acquire(&ModelId::from("weak"));
+        tracker.acquire(&ModelId::from("strong"));
+
+        let router = ClientRouter::single(client.clone()).with_load_tracker(Arc::new(tracker));
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["weak".into(), "strong".into()],
+        });
+        let result = run(algorithm, router, request(), None).await;
+
+        // "strong" has fewer in flight than "weak" (1 < 2), so traffic goes to "strong".
+        let (_, response) = result?;
+        assert_eq!(&*client.calls.lock(), &[ModelId::from("strong")]);
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("strong")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn answer_call_releases_slot_on_completion() -> Result<()> {
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let tracker = ModelLoadTracker::new(vec![
+            (ModelId::from("weak"), 1),
+            (ModelId::from("strong"), 1),
+        ]);
+        let tracker_ref = Arc::new(tracker);
+        let router = ClientRouter::single(client.clone()).with_load_tracker(Arc::clone(&tracker_ref));
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["weak".into(), "strong".into()],
+        });
+        let result = run(algorithm, router, request(), None).await;
+
+        // The call acquired a slot on "weak" and released it when it completed.
+        let (selected, _) = result?;
+        assert_eq!(selected, ModelId::from("weak"));
+        assert_eq!(tracker_ref.in_flight(&ModelId::from("weak")), 0);
         Ok(())
     }
 }

@@ -150,6 +150,7 @@ fn algorithm_build_reports_unknown_configured_target() {
         targets: vec!["missing".to_string()],
         weights: None,
         seed: None,
+        max_in_flight: None,
     };
 
     let error = match spec.build("plugin", &BTreeMap::new()) {

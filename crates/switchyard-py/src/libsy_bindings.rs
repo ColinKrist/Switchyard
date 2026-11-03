@@ -715,18 +715,24 @@ fn noop_algorithm() -> PyAlgorithm {
 }
 
 /// Construct random routing over targets with optional relative weights and seed.
+///
+/// `max_in_flight` is a per-target in-flight answer-call cap. Enforcement is
+/// wired by the Rust runner path; the Python server's client loop ignores it
+/// until a tracker is added there.
 #[pyfunction(name = "random")]
-#[pyo3(signature = (targets, *, weights=None, seed=None))]
+#[pyo3(signature = (targets, *, weights=None, seed=None, max_in_flight=None))]
 fn random_algorithm(
     targets: Vec<String>,
     weights: Option<Vec<f64>>,
     seed: Option<u64>,
+    max_in_flight: Option<u32>,
 ) -> PyResult<PyAlgorithm> {
     let model_ids = targets.into_iter().map(ModelId::new).collect();
     let algorithm = Random::new(model_ids, weights, seed).map_err(|error| match error {
         RustLibsyError::NoTargets => PyValueError::new_err("random requires at least one target"),
         other => PyValueError::new_err(other.to_string()),
     })?;
+    let _ = max_in_flight; // reserved for a future Python-path tracker
     Ok(PyAlgorithm {
         inner: Arc::new(algorithm),
     })

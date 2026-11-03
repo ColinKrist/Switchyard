@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
-    Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
+    Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig, ModelLoadTracker,
     TranslatingLlmClient,
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
@@ -186,8 +186,24 @@ impl DeploymentConfig {
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let (route_clients, caller_auth) =
+            let (mut route_clients, caller_auth) =
                 self.build_route_clients(route_name, config, &clients)?;
+            // Attach a per-target in-flight cap when the route opts into load
+            // limiting. The tracker is shared across every request on the route.
+            if let AlgorithmSpec::Random {
+                targets: target_names,
+                max_in_flight: Some(limit),
+                ..
+            } = &config.algorithm
+            {
+                let tracker_limits = target_names
+                    .iter()
+                    .filter_map(|name| self.targets.get(name).map(|t| (t.id.clone(), *limit)))
+                    .collect();
+                route_clients = route_clients.with_load_tracker(Arc::new(
+                    ModelLoadTracker::new(tracker_limits),
+                ));
+            }
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
             let decision_targets = config
                 .routing_target_names()
@@ -729,6 +745,23 @@ base_threshold = 0.5
             "base_threshold = 0.5\nmax_output_tokens = 256\nescalation = { confirmations = 2 }",
         );
         runner_from_toml(&escalation)?;
+        Ok(())
+    }
+
+    #[test]
+    fn random_route_attaches_load_tracker_when_max_in_flight_configured() -> RunnerResult<()> {
+        let with_cap = VALID_CONFIG.replace(
+            "targets = [\"strong\", \"weak\"]",
+            "targets = [\"strong\", \"weak\"]\nmax_in_flight = 4",
+        );
+        let runner = runner_from_toml(&with_cap)?;
+        let route = runner.route("switchyard/random").expect("route exists");
+        assert!(route.clients().load_tracker().is_some());
+
+        // Without max_in_flight, no tracker is attached
+        let runner_no_cap = runner_from_toml(VALID_CONFIG)?;
+        let route_no_cap = runner_no_cap.route("switchyard/random").expect("route exists");
+        assert!(route_no_cap.clients().load_tracker().is_none());
         Ok(())
     }
 

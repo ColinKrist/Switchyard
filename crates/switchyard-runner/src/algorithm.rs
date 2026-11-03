@@ -229,6 +229,11 @@ pub enum AlgorithmSpec {
         weights: Option<Vec<f64>>,
         /// Makes the sequence of choices repeatable.
         seed: Option<u64>,
+        /// Per-target in-flight answer-call cap. When set, requests distribute
+        /// across targets until capacity is reached, then traffic is directed
+        /// to the least-loaded candidate.
+        #[serde(default)]
+        max_in_flight: Option<u32>,
     },
     /// Sends every request to one target.
     Passthrough {
