@@ -192,18 +192,29 @@ impl Classifier for DecisionClassifier {
         } else {
             "advantage"
         };
+        let mut context = json!({
+            "task": self.input.messages(request),
+            "session": request.metadata.as_ref().and_then(|m| m.session_id.as_deref()),
+            "candidates": self.config.candidates.keys().collect::<Vec<_>>(),
+            "comparison": {
+                "capable": self.config.candidate(capable)?,
+                "efficient": self.config.candidate(efficient)?,
+            },
+            "evidence": self.config.evidence,
+        });
+        // Host-stamped live queue. Absent means the judge was not given one.
+        if let Some(raw) = request.metadata.as_ref().and_then(|metadata| {
+            metadata
+                .extra_metadata
+                .as_ref()
+                .and_then(|extra| extra.get("switchyard.queue"))
+        }) && let Ok(queue) = serde_json::from_str::<Value>(raw)
+        {
+            context["queue"] = queue;
+        }
         let decision = DecisionRequest {
             model: None,
-            context: json!({
-                "task": self.input.messages(request),
-                "session": request.metadata.as_ref().and_then(|m| m.session_id.as_deref()),
-                "candidates": self.config.candidates.keys().collect::<Vec<_>>(),
-                "comparison": {
-                    "capable": self.config.candidate(capable)?,
-                    "efficient": self.config.candidate(efficient)?,
-                },
-                "evidence": self.config.evidence,
-            }),
+            context,
             questions: BTreeMap::from([("route".into(), self.question.clone())]),
         };
         let score = match self.try_score(decision, driver, judge, score_option).await {

@@ -9,6 +9,7 @@ mod metrics;
 mod observability;
 mod observed_translation;
 mod redaction;
+mod queue_card;
 mod response;
 mod routing_log;
 mod shutdown;
@@ -172,6 +173,7 @@ pub struct ServerState {
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
     model_catalog: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>>,
+    queue_card: Arc<parking_lot::RwLock<String>>,
 }
 
 #[derive(Clone)]
@@ -243,6 +245,7 @@ impl ServerState {
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             model_catalog: Arc::default(),
+            queue_card: Arc::new(parking_lot::RwLock::new(String::new())),
         })
     }
 
@@ -377,6 +380,7 @@ impl BoundServer {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> ServerResult<()> {
+        queue_card::spawn(self.state.fallback_http.clone(), Arc::clone(&self.state.queue_card));
         let shutdown_timeout = self.options.shutdown_timeout;
         if let Some(tls) = self.options.tls {
             serve_tls(self.listener, self.router, tls, shutdown_timeout, shutdown).await
@@ -1014,7 +1018,7 @@ fn llm_json_body(
 #[allow(clippy::type_complexity, clippy::result_large_err)]
 fn resolve_route(
     state: &ServerState,
-    metadata: Metadata,
+    mut metadata: Metadata,
     mut body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
@@ -1073,6 +1077,13 @@ fn resolve_route(
             "invalid_request_error",
             "unsupported_capability",
         ));
+    }
+    let card = state.queue_card.read().clone();
+    if !card.is_empty() {
+        metadata
+            .extra_metadata
+            .get_or_insert_with(BTreeMap::new)
+            .insert(queue_card::QUEUE_KEY.to_string(), card);
     }
     let request = Request {
         llm_request,
