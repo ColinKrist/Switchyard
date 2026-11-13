@@ -182,8 +182,14 @@ impl TraceStore {
         Ok(())
     }
 
+    /// Sentinel session id for rows whose `session_id` is NULL (no client
+    /// `x-switchyard-session-id` header was sent).  The portal renders this
+    /// as "Unattributed".
+    pub const UNATTRIBUTED: &str = "__unattributed__";
+
     /// Distinct session ids with their call count and first/last timestamp,
-    /// newest first. `limit` is clamped to 1..=500.
+    /// newest first.  Rows with NULL session_id are grouped under the
+    /// [`UNATTRIBUTED`] sentinel.  `limit` is clamped to 1..=500.
     pub(crate) fn sessions(
         &self,
         limit: usize,
@@ -194,14 +200,16 @@ impl TraceStore {
             .lock()
             .map_err(|_| Self::poisoned())?;
         let mut stmt = conn.prepare(
-            "SELECT s.session_id, COUNT(*) AS calls, MIN(r.ts) AS first_ts, MAX(r.ts) AS last_ts
-             FROM (SELECT DISTINCT session_id FROM trace_records WHERE session_id IS NOT NULL) AS s
-             JOIN trace_records AS r ON r.session_id = s.session_id
-             GROUP BY s.session_id
+            "SELECT COALESCE(s.session_id, ?1) AS session_id,
+                    COUNT(*) AS calls, MIN(r.ts) AS first_ts, MAX(r.ts) AS last_ts
+             FROM (SELECT DISTINCT session_id FROM trace_records) AS s
+             JOIN trace_records AS r ON (r.session_id = s.session_id
+                OR (s.session_id IS NULL AND r.session_id IS NULL))
+             GROUP BY COALESCE(s.session_id, ?1)
              ORDER BY last_ts DESC
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
-        let mut rows = stmt.query(params![limit as i64])?;
+        let mut rows = stmt.query(params![Self::UNATTRIBUTED, limit as i64])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let session_id: String = row.get(0)?;
@@ -215,22 +223,39 @@ impl TraceStore {
 
     /// All `trace_records` rows for one session in timestamp order, each as a
     /// JSON object mirroring the record (bodies parse back to JSON when intact,
-    /// otherwise a raw string for a truncated body).
-    pub(crate) fn session_transcript(&self, session_id: &str) -> SqliteResult<Vec<Value>> {
+    /// otherwise a raw string for a truncated body).  `limit` caps the row
+    /// count; `offset` skips leading rows.  Both `None` returns every row.
+    pub(crate) fn session_transcript(
+        &self,
+        session_id: &str,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> SqliteResult<Vec<Value>> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| Self::poisoned())?;
-        let mut stmt = conn.prepare(
+        let is_unattributed = session_id == Self::UNATTRIBUTED;
+        let bind_id: Option<&str> = if is_unattributed { None } else { Some(session_id) };
+        let mut sql = String::from(
             "SELECT ts, session_id, turn_id, model, route_id,
                     prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens,
                     duration_s, ttft_s,
                     request_body, response_body, wire_body, truncated
-             FROM trace_records WHERE session_id = ?1 ORDER BY ts ASC, rowid ASC",
-        )?;
-        let mut rows = stmt.query(params![session_id])?;
+             FROM trace_records WHERE session_id IS ?1
+             ORDER BY ts ASC, rowid ASC",
+        );
+        if limit.is_some() || offset.is_some() {
+            sql.push_str(" LIMIT ?2 OFFSET ?3");
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows_iter = if limit.is_some() || offset.is_some() {
+            stmt.query(params![bind_id, limit.unwrap_or(0) as i64, offset.unwrap_or(0) as i64])?
+        } else {
+            stmt.query(params![bind_id])?
+        };
         let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows_iter.next()? {
             let truncated: i64 = row.get(14)?;
             out.push(serde_json::json!({
                 "ts": row.get::<_, String>(0)?,
@@ -335,11 +360,11 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0, "sess-1");
         assert_eq!(sessions[0].1, 3);
-        let transcript = store.session_transcript("sess-1").expect("transcript");
+        let transcript = store.session_transcript("sess-1", None, None).expect("transcript");
         assert_eq!(transcript.len(), 3);
         assert_eq!(transcript[0]["model"], "a");
         assert_eq!(transcript[0]["duration_s"], 0.5);
-        let missing = store.session_transcript("nope").expect("missing");
+        let missing = store.session_transcript("nope", None, None).expect("missing");
         assert!(missing.is_empty());
     }
 

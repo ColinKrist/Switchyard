@@ -67,8 +67,11 @@ pub const DEFAULT_LISTEN_BACKLOG: u32 = 65_535;
 /// Default time allowed for active requests to finish during shutdown.
 pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum buffered JSON request size accepted by the LLM endpoints.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum buffered JSON body size, applied to both incoming requests
+/// (via `DefaultBodyLimit`) and outgoing JSON responses (the redaction
+/// middleware's `to_bytes` buffer uses this same cap).  512 MiB covers
+/// large session-transcript responses with full payload bodies.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 const HEADER_SELECTED_MODEL: &str = "x-model-router-selected-model";
 const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
@@ -1616,6 +1619,18 @@ struct SessionStatsQuery {
     session_id: String,
 }
 
+/// Query params for the session-transcript endpoint.  `limit` caps how many
+/// rows are returned per call; `offset` supports pagination.  Both are
+/// optional and default to "all rows".
+#[derive(Deserialize)]
+struct TranscriptQuery {
+    session_id: String,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
 // TODO: This loads the entire file. It should stream the JSONL instead.
 // Huge files will crash the demo server.
 async fn get_session_stats(
@@ -1653,7 +1668,7 @@ async fn get_session_stats(
                 let store = store.clone();
                 let session_id = snapshot.session_id().to_string();
                 let transcript =
-                    task::spawn_blocking(move || store.session_transcript(&session_id))
+                    task::spawn_blocking(move || store.session_transcript(&session_id, None, None))
                         .await
                         .ok()
                         .and_then(|result| result.ok())
@@ -1730,7 +1745,7 @@ async fn get_routing_sessions(
 /// Returns every trace record for one session in timestamp order.
 async fn get_session_transcript(
     State(state): State<ServerState>,
-    query: std::result::Result<Query<SessionStatsQuery>, QueryRejection>,
+    query: std::result::Result<Query<TranscriptQuery>, QueryRejection>,
 ) -> Response {
     let Some(store) = state.trace_db.as_ref() else {
         return not_found().await;
@@ -1747,10 +1762,12 @@ async fn get_session_transcript(
         }
     };
     let session_id = query.session_id;
+    let limit = query.limit.map(u64::from);
+    let offset = query.offset.map(u64::from);
     let store = store.clone();
     let value = session_id.clone();
     let records =
-        match task::spawn_blocking(move || store.session_transcript(&value)).await {
+        match task::spawn_blocking(move || store.session_transcript(&value, limit, offset)).await {
             Ok(records) => records,
             Err(error) => return server_error(format!("failed to read transcript: {error}")),
         };
