@@ -1119,6 +1119,8 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    let trace_session_id = metadata.session_id.clone();
+    let trace_turn_id = metadata.turn_id.clone();
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
@@ -1137,19 +1139,18 @@ async fn handle_llm_request(
         let wire_body =
             switchyard_translation::helpers::encode_request(&request.llm_request, wire_format)
                 .unwrap_or(Value::Null);
+        let session_id = trace_session_id.clone();
+        let turn_id = trace_turn_id.clone();
+        let route_id = routing_log_context
+            .as_ref()
+            .map(|context| context.route_id().to_string())
+            .unwrap_or_else(|| route.algorithm_name().to_string());
         Some(TraceCapture {
             store: store.clone(),
             redactor: std::sync::Arc::clone(&state.redactor),
-            session_id: routing_log_context
-                .as_ref()
-                .and_then(|context| context.session_id().clone()),
-            turn_id: routing_log_context
-                .as_ref()
-                .and_then(|context| context.turn_id().clone()),
-            route_id: routing_log_context
-                .as_ref()
-                .map(|context| context.route_id().to_string())
-                .unwrap_or_default(),
+            session_id,
+            turn_id,
+            route_id,
             request_body,
             wire_body,
         })
