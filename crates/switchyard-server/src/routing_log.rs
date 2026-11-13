@@ -218,6 +218,19 @@ impl RoutingLogContext {
             agent: AgentIdentity::from_metadata(metadata),
         }
     }
+    pub(crate) fn session_id(&self) -> &Option<String> {
+        &self.session_id
+    }
+
+    /// The normalized turn identifier, when supplied by the client.
+    pub(crate) fn turn_id(&self) -> &Option<String> {
+        &self.turn_id
+    }
+
+    /// The resolved route identity shared by every log entry for one request.
+    pub(crate) fn route_id(&self) -> &str {
+        &self.route_id
+    }
 
     /// Attaches the resolved route identity shared by every log entry for this request.
     pub(crate) fn with_route(mut self, route_id: impl Into<String>, algorithm: &str) -> Self {
@@ -296,6 +309,14 @@ pub(crate) struct SessionStatsSnapshot {
     models: BTreeMap<ModelId, SessionModelStats>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     outcomes: Vec<LoggedOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) transcript: Vec<serde_json::Value>,
+}
+
+impl SessionStatsSnapshot {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 #[derive(Deserialize, Serialize)]

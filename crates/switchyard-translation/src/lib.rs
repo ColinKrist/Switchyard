@@ -10,7 +10,7 @@ mod compaction;
 pub mod diagnostic;
 pub mod engine;
 pub mod error;
-mod helpers;
+pub mod helpers;
 pub mod policy;
 mod sse;
 pub mod stream;

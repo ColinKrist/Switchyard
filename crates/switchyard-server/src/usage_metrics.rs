@@ -5,15 +5,22 @@
 
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use futures_util::StreamExt;
 use opentelemetry::{KeyValue, global};
-use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
+use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, ResponseAccumulator, Usage};
 
 use crate::SharedRoutingLog;
 use crate::routing_log::RoutingLogContext;
 use crate::stats::{StatsAccumulator, TokenUsage};
+use crate::trace_db::TraceCapture;
 
 /// Observes a routed response without changing its aggregate or streaming contents.
+///
+/// When `trace` is present, one row per finished call is written to the
+/// [`TraceStore`](crate::trace_db::TraceStore) so the session transcript portal
+/// can replay it. Streaming responses are reassembled into an aggregate before
+/// the row is recorded; the stream itself is left untouched.
 pub(crate) fn observe(
     response: Response,
     model: &str,
@@ -21,6 +28,7 @@ pub(crate) fn observe(
     stats: StatsAccumulator,
     cache_eligible: f64,
     routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    trace: Option<TraceCapture>,
 ) -> Response {
     let Response {
         llm_response,
@@ -35,13 +43,24 @@ pub(crate) fn observe(
             if let Some((log, context)) = routing_log {
                 log.append(context, &model, None, &agg.usage);
             }
+            // Buffered responses have no separate first-token boundary: the whole call
+            // ran before the response was available, so time-to-first-token equals the
+            // full call duration.
+            let duration_s = started.elapsed().as_secs_f64();
+            if let Some(capture) = trace {
+                let response_body = serde_json::to_value(&agg).unwrap_or(Value::Null);
+                let _ = capture.write(&model, &agg.usage, duration_s, Some(duration_s), &response_body);
+            }
             LlmResponse::Agg(agg)
         }
         LlmResponse::Stream(mut stream) => {
+            let trace = trace;
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
                 let mut recorded = false;
+                let mut trace_acc = trace.is_some().then(ResponseAccumulator::new);
+                let mut first_content_at: Option<std::time::Instant> = None;
                 while let Some(item) = stream.next().await {
                     let failed = match &item {
                         Err(_) => true,
@@ -55,6 +74,22 @@ pub(crate) fn observe(
                     };
                     if let Ok(event) = &item {
                         for chunk in event.normalized() {
+                            // Time-to-first-token is the first content-bearing chunk
+                            // (text, reasoning, or tool call), not the MessageStart frame.
+                            if first_content_at.is_none()
+                                && matches!(
+                                    chunk,
+                                    LlmResponseChunk::TextDelta { .. }
+                                        | LlmResponseChunk::ReasoningDelta { .. }
+                                        | LlmResponseChunk::ReasoningDetailsDelta { .. }
+                                        | LlmResponseChunk::ToolCallDelta { .. }
+                                )
+                            {
+                                first_content_at = Some(std::time::Instant::now());
+                            }
+                            if let Some(acc) = &mut trace_acc {
+                                acc.push(chunk.clone());
+                            }
                             match chunk {
                                 LlmResponseChunk::Usage(usage) => {
                                     latest_usage = Some(usage.clone());
@@ -67,7 +102,8 @@ pub(crate) fn observe(
                         }
                     }
                     if failed && !recorded
-                        && let Some((log, context)) = routing_log.as_ref() {
+                        && let Some((log, context)) = routing_log.as_ref()
+                    {
                         log.append(context.clone(), &model, None, &Usage::default());
                     }
                     if failed {
@@ -83,6 +119,20 @@ pub(crate) fn observe(
                             log.append(context.clone(), &model, None, usage);
                         }
                         recorded = true;
+                        if let (Some(capture), Some(acc)) = (trace.as_ref(), trace_acc.take()) {
+                            let duration_s = started.elapsed().as_secs_f64();
+                            let ttft_s = first_content_at
+                                .map(|at| at.saturating_duration_since(started).as_secs_f64());
+                            let response_body = serde_json::to_value(&acc.finish())
+                                .unwrap_or(Value::Null);
+                            let _ = capture.write(
+                                &model,
+                                usage,
+                                duration_s,
+                                ttft_s,
+                                &response_body,
+                            );
+                        }
                     }
                     yield item;
                     if failed {
@@ -94,6 +144,14 @@ pub(crate) fn observe(
                     record_terminal(&stats, &usage, &model, started, cache_eligible);
                     if let Some((log, context)) = routing_log {
                         log.append(context, &model, None, &usage);
+                    }
+                    if let (Some(capture), Some(acc)) = (trace, trace_acc) {
+                        let duration_s = started.elapsed().as_secs_f64();
+                        let ttft_s = first_content_at
+                            .map(|at| at.saturating_duration_since(started).as_secs_f64());
+                        let response_body = serde_json::to_value(&acc.finish())
+                            .unwrap_or(Value::Null);
+                        let _ = capture.write(&model, &usage, duration_s, ttft_s, &response_body);
                     }
                 }
             };
@@ -225,6 +283,7 @@ mod tests {
             stats.clone(),
             0.0,
             Some((log.clone(), context)),
+            None,
         );
 
         let LlmResponse::Stream(mut observed) = observed.llm_response else {

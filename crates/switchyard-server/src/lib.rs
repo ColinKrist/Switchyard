@@ -17,6 +17,7 @@ mod sse;
 mod stats;
 #[cfg(test)]
 mod testing;
+mod trace_db;
 mod usage_metrics;
 
 use std::collections::BTreeMap;
@@ -55,6 +56,7 @@ use tracing::{Instrument, Level};
 use switchyard_translation::WireFormat;
 
 use crate::response::into_http_response;
+use crate::trace_db::{TraceCapture, TraceStore};
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
 pub use observability::{flush_observability, initialize_observability};
@@ -171,8 +173,9 @@ pub struct ServerState {
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
+    trace_db: Option<Arc<TraceStore>>,
     track_cache_eligibility: bool,
-    model_catalog: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>>,
+    model_catalog: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>> ,
     queue_card: Arc<parking_lot::RwLock<String>>,
 }
 
@@ -243,6 +246,7 @@ impl ServerState {
             metrics,
             stats,
             routing_log: None,
+            trace_db: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             model_catalog: Arc::default(),
             queue_card: Arc::new(parking_lot::RwLock::new(String::new())),
@@ -252,6 +256,14 @@ impl ServerState {
     /// Enables durable per-request routing records at `path`.
     pub fn with_routing_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
         self.routing_log = Some(SharedRoutingLog::new(path.into())?);
+        Ok(self)
+    }
+
+    /// Enables the SQLite trace database for the transcript portal at `path`.
+    pub fn with_trace_db(mut self, path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+        let store =
+            TraceStore::open(path.as_ref()).map_err(|error| ServerError::new(error.to_string()))?;
+        self.trace_db = Some(Arc::new(store));
         Ok(self)
     }
 
@@ -553,6 +565,11 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/health", get(health));
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
+    }
+    if state.trace_db.is_some() {
+        router = router
+            .route("/v1/routing/sessions", get(get_routing_sessions))
+            .route("/v1/routing/session-transcript", get(get_session_transcript));
     }
     finish_router(router.fallback(proxy_unmatched), state)
 }
@@ -1113,7 +1130,31 @@ async fn handle_llm_request(
             route.algorithm_name(),
         )
     });
-    // Only the Codex namespace mapping is needed downstream, not the whole request.
+    // Capture request/wire payloads before the call so the trace row can be written
+    // by the observer when the response finishes, even for streams.
+    let trace_capture = state.trace_db.as_ref().and_then(|store: &Arc<TraceStore>| {
+        let request_body = request.raw_request.clone().unwrap_or(Value::Null);
+        let wire_body =
+            switchyard_translation::helpers::encode_request(&request.llm_request, wire_format)
+                .unwrap_or(Value::Null);
+        Some(TraceCapture {
+            store: store.clone(),
+            redactor: std::sync::Arc::clone(&state.redactor),
+            session_id: routing_log_context
+                .as_ref()
+                .and_then(|context| context.session_id().clone()),
+            turn_id: routing_log_context
+                .as_ref()
+                .and_then(|context| context.turn_id().clone()),
+            route_id: routing_log_context
+                .as_ref()
+                .map(|context| context.route_id().to_string())
+                .unwrap_or_default(),
+            request_body,
+            wire_body,
+        })
+    });
+
     let request_extensions = request.llm_request.extensions.clone();
     let observer = stats_observer(
         state.stats.clone(),
@@ -1154,6 +1195,7 @@ async fn handle_llm_request(
             state.stats,
             cache_eligible,
             state.routing_log.zip(routing_log_context),
+            trace_capture,
         )
     } else {
         response
@@ -1605,7 +1647,20 @@ async fn get_session_stats(
         };
 
     match snapshot {
-        Ok(Some(snapshot)) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Ok(Some(mut snapshot)) => {
+            if let Some(store) = state.trace_db.as_ref() {
+                let store = store.clone();
+                let session_id = snapshot.session_id().to_string();
+                let transcript =
+                    task::spawn_blocking(move || store.session_transcript(&session_id))
+                        .await
+                        .ok()
+                        .and_then(|result| result.ok())
+                        .unwrap_or_default();
+                snapshot.transcript = transcript;
+            }
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
         Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             "Routing session not found",
@@ -1613,6 +1668,94 @@ async fn get_session_stats(
             "routing_session_not_found",
         ),
         Err(error) => server_error(format!("failed to read routing log: {error}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct RoutingSessionsQuery {
+    #[serde(default = "default_session_limit")]
+    limit: usize,
+}
+
+fn default_session_limit() -> usize {
+    50
+}
+
+/// Lists distinct routing sessions recorded in the trace store, newest first.
+async fn get_routing_sessions(
+    State(state): State<ServerState>,
+    query: std::result::Result<Query<RoutingSessionsQuery>, QueryRejection>,
+) -> Response {
+    let Some(store) = state.trace_db.as_ref() else {
+        return not_found().await;
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                "invalid_request_error",
+                "invalid_query",
+            );
+        }
+    };
+    let limit = query.limit.clamp(1, 500);
+    let store = store.clone();
+    let sessions =
+        match task::spawn_blocking(move || store.sessions(limit)).await {
+            Ok(sessions) => sessions,
+            Err(error) => return server_error(format!("failed to list sessions: {error}")),
+        };
+    match sessions {
+        Ok(rows) => {
+            let sessions: Vec<Value> = rows
+                .into_iter()
+                .map(|(session_id, calls, first_ts, last_ts)| {
+                    json!({
+                        "session_id": session_id,
+                        "calls": calls,
+                        "first_ts": first_ts,
+                        "last_ts": last_ts,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "sessions": sessions }))).into_response()
+        }
+        Err(error) => server_error(format!("failed to list sessions: {error}")),
+    }
+}
+
+/// Returns every trace record for one session in timestamp order.
+async fn get_session_transcript(
+    State(state): State<ServerState>,
+    query: std::result::Result<Query<SessionStatsQuery>, QueryRejection>,
+) -> Response {
+    let Some(store) = state.trace_db.as_ref() else {
+        return not_found().await;
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                "invalid_request_error",
+                "invalid_query",
+            );
+        }
+    };
+    let session_id = query.session_id;
+    let store = store.clone();
+    let value = session_id.clone();
+    let records =
+        match task::spawn_blocking(move || store.session_transcript(&value)).await {
+            Ok(records) => records,
+            Err(error) => return server_error(format!("failed to read transcript: {error}")),
+        };
+    match records {
+        Ok(records) => (StatusCode::OK, Json(json!({ "session_id": session_id, "requests": records }))).into_response(),
+        Err(error) => server_error(format!("failed to read transcript: {error}")),
     }
 }
 

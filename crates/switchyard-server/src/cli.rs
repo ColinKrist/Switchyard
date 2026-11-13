@@ -56,6 +56,10 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "PATH", requires = "routing_log_file")]
     pricing_file: Option<PathBuf>,
 
+    /// Enable the SQLite trace database (transcript portal) at this file path.
+    #[arg(long, value_name = "PATH")]
+    trace_db: Option<PathBuf>,
+
     /// TLS certificate path in PEM format.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -76,8 +80,8 @@ impl ServerArgs {
         if let Some(path) = self.routing_log_file {
             state = state.with_routing_log(path)?;
         }
-        if let Some(path) = self.pricing_file {
-            state = state.with_pricing_file(path)?;
+        if let Some(path) = self.trace_db {
+            state = state.with_trace_db(path)?;
         }
         let tls = match (self.tls_cert, self.tls_key) {
             (Some(cert), Some(key)) => {
