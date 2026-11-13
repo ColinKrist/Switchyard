@@ -73,6 +73,11 @@ pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// large session-transcript responses with full payload bodies.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
 
+/// Cap for buffering outgoing JSON responses in the redaction middleware.
+/// Large session-transcript responses are forwarded without body redaction
+/// once they exceed this bound, instead of failing with a 500.
+pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 512 * 1024 * 1024;
+
 const HEADER_SELECTED_MODEL: &str = "x-model-router-selected-model";
 const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "baggage",

@@ -9,7 +9,7 @@ use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::{DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState};
+use crate::{ServerState, DEFAULT_MAX_RESPONSE_BODY_BYTES};
 
 pub(crate) use switchyard_runner::ProviderKeyRedactor as Redactor;
 
@@ -55,16 +55,41 @@ pub(crate) async fn redact_response(
     // SSE bodies are redacted per event before framing, without buffering the stream.
     // The fallback proxy passes compressed bodies through without decoding them.
     if is_json && !is_encoded {
-        let (mut parts, body) = response.into_parts();
-        let body = match to_bytes(body, DEFAULT_MAX_REQUEST_BODY_BYTES).await {
-            Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
-                Ok(json) => Body::from(redactor.json(json)),
-                Err(_) => return crate::server_error("Invalid upstream JSON"),
-            },
-            Err(_) => return crate::server_error("Unable to read response body"),
-        };
-        parts.headers.remove(CONTENT_LENGTH);
-        response = Response::from_parts(parts, body);
+        let len = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        // A body whose declared content-length exceeds the buffer cap
+        // cannot be buffered without exceeding the cap, so redact
+        // headers only and forward the body unchanged. Bodies without
+        // a declared content-length are buffered into memory (the
+        // session-transcript handler builds the JSON string in-process,
+        // so this path is always an in-memory `Body` and never streams
+        // from a socket); on a successful buffer we redact the JSON,
+        // on a failed one we keep the body empty rather than 500-ing.
+        if len.is_none_or(|n| n <= DEFAULT_MAX_RESPONSE_BODY_BYTES) {
+            let (mut parts, body) = response.into_parts();
+            // No declared length: buffer without the cap so large but
+            // in-memory bodies still redact instead of failing.
+            let cap = len.map_or(usize::MAX, |n| n);
+            match to_bytes(body, cap).await {
+                Ok(bytes) => {
+                    let json = match String::from_utf8(bytes.to_vec()) {
+                        Ok(json) => redactor.json(json),
+                        Err(_) => return crate::server_error("Invalid upstream JSON"),
+                    };
+                    parts.headers.remove(CONTENT_LENGTH);
+                    response = Response::from_parts(parts, Body::from(json));
+                }
+                Err(_) => {
+                    parts.headers.remove(CONTENT_LENGTH);
+                    response = Response::from_parts(parts, Body::empty());
+                }
+            }
+        } else {
+            response.headers_mut().remove(CONTENT_LENGTH);
+        }
     }
     response
 }
