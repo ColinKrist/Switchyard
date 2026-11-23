@@ -360,7 +360,7 @@ Capability mode classifies before serving. See
 | `unmatched_steps` | No | `1` | Threshold steps applied to an unmatched verdict (no capability rule applies). `0`, `1`, or `2`; `2` treats it like an unsupported verdict. |
 | `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and retains that target across intervening tool calls only when requests carry a session ID; without a session ID, it behaves like `every_request`. `new_session` judges once and reuses that target for the session. |
 | `message_hash_fallback` | No | `false` | Retains the target against a hash of the first user message when a request carries no session ID. Requires `classify_trigger = "new_session"` or `"user_turn"`. |
-| `recent_turn_window` | No | unset | LLM judges default to the opening task and latest user follow-up. Decision judges default to the opening task plus 10 recent messages. An explicit value sets the trailing message window. |
+| `recent_turn_window` | No | unset | LLM and decision judges default to the opening task and latest user follow-up, with tool calls, tool results, and reasoning removed. An explicit value sets the trailing message window. |
 | `prompt` | No | packaged prompt | Replaces the capability prompt. The packaged schema is sent separately as structured-output configuration. |
 
 Escalation mode serves the weak target first and judges the completed turn. See
@@ -427,7 +427,7 @@ Direct mode asks a decision target to select one model group. See
 | `models` | Yes | — | Model groups, as in custom mode. Every non-empty group except `judge` and `any` is an option, and its name is the option ID. Needs at least two options. `models.judge` must name a decision target. |
 | `default_target` | Yes | — | Option used when the decision call fails or returns a choice that is not an option. |
 | `fail_open` | No | `true` | When `true`, decision call failures, deadlines, and invalid choices route to `default_target`. When `false`, they stop the request. |
-| `recent_turn_window` | No | `10` | Trailing turns sent as `task` after the opening task. |
+| `recent_turn_window` | No | unset | Unset sends the opening task and latest user follow-up without tool traffic. An explicit value sends that many trailing turns after the opening task. |
 
 ### `stage_router`
 

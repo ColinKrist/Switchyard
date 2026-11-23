@@ -1589,9 +1589,9 @@ mod tests {
             .messages
             .push(Message::text(Role::User, "latest follow-up"));
         let original_messages = request.llm_request.messages.clone();
+        // Unset window: opening task and latest follow-up only, no assistant turns.
         let expected_task = json!([
             original_messages[0].clone(),
-            Message::text(Role::Assistant, "visible progress"),
             Message::text(Role::User, "latest follow-up"),
         ]);
 

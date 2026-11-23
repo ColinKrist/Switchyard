@@ -19,8 +19,8 @@ use crate::algorithms::util::llm_judge::{libsy_error_reason, report_fail_open};
 use crate::algorithms::util::robustness::safe_error_summary;
 use crate::{Classification, Classifier, Driver, LibsyError, Result, Score, State};
 
-/// Trailing turns sent to a decision service when the route sets no window.
-const DEFAULT_TURN_WINDOW: usize = 10;
+// Unset `recent_turn_window` sends the judge the opening task and latest user
+// follow-up only, with tool calls, tool results, and reasoning removed.
 
 /// Instructions, evidence, and cutoff policy for a decision judge.
 ///
@@ -91,10 +91,9 @@ pub(super) struct DecisionClassifier {
 impl DecisionClassifier {
     pub(super) fn new(
         mut config: DecisionJudgeConfig,
-        mut input: TaskInput,
+        input: TaskInput,
         fail_open: bool,
     ) -> Result<Self> {
-        input.recent_turn_window.get_or_insert(DEFAULT_TURN_WINDOW);
         let instructions = match config.instructions.take() {
             Some(instructions) => instructions,
             None => serde_json::from_str(include_str!(
@@ -265,7 +264,8 @@ pub struct DirectClassifierConfig {
     pub classify_trigger: ClassifyTrigger,
     /// Uses the first user message when session metadata is unavailable.
     pub message_hash_fallback: bool,
-    /// Trailing conversation turns sent to the decision service. Defaults to 10.
+    /// Trailing conversation turns sent to the decision service. Unset sends the
+    /// opening task and latest user follow-up without tool traffic.
     pub recent_turn_window: Option<usize>,
 }
 
@@ -302,7 +302,7 @@ impl DirectClassifier {
         };
         Ok(Self {
             input: TaskInput {
-                recent_turn_window: Some(config.recent_turn_window.unwrap_or(DEFAULT_TURN_WINDOW)),
+                recent_turn_window: config.recent_turn_window,
             },
             config,
             question,
